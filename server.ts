@@ -11,6 +11,10 @@ interface ConnectionState {
   client: Client;
   transport: any;
   serverUrl: string;
+  transportType?: "streamable" | "sse";
+  headers?: Record<string, string>;
+  lastActivity?: number;
+  reconnecting?: boolean;
 }
 
 interface OAuthTokens {
@@ -158,7 +162,7 @@ async function startServer() {
                   transport = new StreamableHTTPClientTransport(urlObj, { requestInit: { headers: reqHeaders } });
                 }
                 await client.connect(transport);
-                connections.set(u, { client, transport, serverUrl: u });
+                connections.set(u, { client, transport, serverUrl: u, transportType: urlObj.pathname.endsWith("/sse") ? "sse" : "streamable", headers: reqHeaders, lastActivity: Date.now(), reconnecting: false });
                 console.log(`[Auto-Restore] Successfully restored ${u}`);
               } catch (e: any) {
                 console.warn(`[Auto-Restore] Could not auto-restore ${u}:`, e.message);
@@ -169,6 +173,132 @@ async function startServer() {
       }
     } catch (_) {}
   }
+
+  // ==========================================
+  // Persistent Connection: keep-alive + auto-reconnect
+  // ==========================================
+  const HEARTBEAT_INTERVAL_MS = 30 * 1000; // ping every 30s to keep connection alive
+  const STALE_THRESHOLD_MS = 90 * 1000;    // consider connection stale after 90s of inactivity
+
+  // Build a transport for a given url + type, carrying auth headers so reconnects stay authenticated
+  function buildTransport(type: "streamable" | "sse", url: URL, headers: Record<string, string>) {
+    if (type === "sse") {
+      return new SSEClientTransport(url, {
+        requestInit: { headers },
+        eventSourceInit: { headers } as any,
+      });
+    }
+    return new StreamableHTTPClientTransport(url, { requestInit: { headers } });
+  }
+
+  // Establish a fresh connection and store it (used by connect endpoint, restore, and reconnect)
+  async function establishConnection(
+    targetUrl: string,
+    headers: Record<string, string>,
+    preferredType?: "streamable" | "sse"
+  ): Promise<ConnectionState> {
+    const urlObj = new URL(targetUrl);
+    const attempts: Array<{ type: "streamable" | "sse"; url: URL }> = [];
+
+    if (preferredType) {
+      attempts.push({ type: preferredType, url: urlObj });
+    }
+    if (urlObj.pathname.endsWith("/sse")) {
+      attempts.push({ type: "sse", url: urlObj });
+      attempts.push({ type: "streamable", url: urlObj });
+      const altUrl = new URL(urlObj.href);
+      altUrl.pathname = altUrl.pathname.replace(/\/sse$/, "/mcp");
+      attempts.push({ type: "streamable", url: altUrl });
+    } else {
+      attempts.push({ type: "streamable", url: urlObj });
+      attempts.push({ type: "sse", url: urlObj });
+      const altUrl = new URL(urlObj.href);
+      if (altUrl.pathname.endsWith("/mcp")) {
+        altUrl.pathname = altUrl.pathname.replace(/\/mcp$/, "/sse");
+        attempts.push({ type: "sse", url: altUrl });
+      }
+    }
+
+    let lastErr: any = null;
+    for (const attempt of attempts) {
+      const client = new Client({ name: "mcp-web-client", version: "1.0.6" }, { capabilities: {} } as any);
+      const transport = buildTransport(attempt.type, attempt.url, headers);
+      try {
+        const connectPromise = client.connect(transport);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Timeout connecting via ${attempt.type}`)), 8000)
+        );
+        await Promise.race([connectPromise, timeoutPromise]);
+        const state: ConnectionState = {
+          client,
+          transport,
+          serverUrl: targetUrl,
+          transportType: attempt.type,
+          headers,
+          lastActivity: Date.now(),
+          reconnecting: false,
+        };
+        connections.set(targetUrl, state);
+        return state;
+      } catch (err: any) {
+        lastErr = err;
+        try { await transport.close(); } catch (_) {}
+      }
+    }
+    throw lastErr || new Error("All connection attempts failed");
+  }
+
+  // Ensure a live connection before performing an operation; auto-reconnect if stale/dead
+  async function ensureConnection(serverUrl: string): Promise<ConnectionState> {
+    let state = connections.get(serverUrl);
+    if (!state) {
+      throw new Error("No active MCP connection for the given server URL");
+    }
+
+    const isStale = !state.lastActivity || Date.now() - state.lastActivity > STALE_THRESHOLD_MS;
+
+    // Lightweight liveness probe; if it fails, transparently reconnect
+    try {
+      if (isStale) {
+        await state.client.listTools();
+        state.lastActivity = Date.now();
+      }
+      return state;
+    } catch (err: any) {
+      console.warn(`[Persistent] Connection to ${serverUrl} appears dead, reconnecting:`, err?.message);
+      try { await state.transport.close(); } catch (_) {}
+      const headers = state.headers || { "Accept": "application/json, text/event-stream" };
+      const reconnected = await establishConnection(serverUrl, headers, state.transportType);
+      console.log(`[Persistent] Reconnected to ${serverUrl}`);
+      return reconnected;
+    }
+  }
+
+  // Heartbeat: periodically ping every live connection so idle timeouts don't silently drop it
+  const heartbeatTimer = setInterval(async () => {
+    for (const [url, state] of connections.entries()) {
+      if (state.reconnecting) continue;
+      try {
+        await state.client.listTools();
+        state.lastActivity = Date.now();
+      } catch (err: any) {
+        console.warn(`[Heartbeat] Ping failed for ${url}, attempting reconnect:`, err?.message);
+        state.reconnecting = true;
+        try { await state.transport.close(); } catch (_) {}
+        try {
+          const headers = state.headers || { "Accept": "application/json, text/event-stream" };
+          await establishConnection(url, headers, state.transportType);
+          console.log(`[Heartbeat] Auto-reconnected ${url}`);
+        } catch (e: any) {
+          console.warn(`[Heartbeat] Reconnect failed for ${url}:`, e?.message);
+          const existing = connections.get(url);
+          if (existing) existing.reconnecting = false;
+        }
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  // Don't keep the event loop alive solely for the heartbeat
+  (heartbeatTimer as any).unref?.();
 
   // Restore previous sessions in background
   restoreSessionsFromDisk();
@@ -554,85 +684,9 @@ async function startServer() {
         });
       }
 
-      const urlObj = new URL(targetUrl);
-      const attempts: Array<{ type: "streamable" | "sse"; url: URL }> = [];
-
-      if (urlObj.pathname.endsWith("/sse")) {
-        attempts.push({ type: "sse", url: urlObj });
-        attempts.push({ type: "streamable", url: urlObj });
-        const altUrl = new URL(urlObj.href);
-        altUrl.pathname = altUrl.pathname.replace(/\/sse$/, "/mcp");
-        attempts.push({ type: "streamable", url: altUrl });
-      } else {
-        attempts.push({ type: "streamable", url: urlObj });
-        attempts.push({ type: "sse", url: urlObj });
-        const altUrl = new URL(urlObj.href);
-        if (altUrl.pathname.endsWith("/mcp")) {
-          altUrl.pathname = altUrl.pathname.replace(/\/mcp$/, "/sse");
-          attempts.push({ type: "sse", url: altUrl });
-        }
-      }
-
-      let connectedClient: Client | null = null;
-      let connectedTransport: any = null;
-      let lastErr: any = null;
-
-      for (const attempt of attempts) {
-        const client = new Client(
-          {
-            name: "mcp-web-client",
-            version: "1.0.5",
-          },
-          {
-            capabilities: {},
-          } as any
-        );
-
-        let transport: any;
-        if (attempt.type === "streamable") {
-          transport = new StreamableHTTPClientTransport(attempt.url, {
-            requestInit: {
-              headers: mergedHeaders,
-            },
-          });
-        } else {
-          transport = new SSEClientTransport(attempt.url, {
-            requestInit: {
-              headers: mergedHeaders,
-            },
-            eventSourceInit: {
-              headers: mergedHeaders,
-            } as any,
-          });
-        }
-
-        try {
-          const connectPromise = client.connect(transport);
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`Timeout connecting via ${attempt.type}`)), 8000)
-          );
-          await Promise.race([connectPromise, timeoutPromise]);
-          connectedClient = client;
-          connectedTransport = transport;
-          break;
-        } catch (err: any) {
-          console.warn(`Attempt failed (${attempt.type} on ${attempt.url.href}):`, err.message);
-          lastErr = err;
-          try {
-            await transport.close();
-          } catch (_) {}
-        }
-      }
-
-      if (!connectedClient || !connectedTransport) {
-        throw lastErr || new Error("All connection attempts failed");
-      }
-
-      connections.set(targetUrl, {
-        client: connectedClient,
-        transport: connectedTransport,
-        serverUrl: targetUrl,
-      });
+      // Establish a persistent connection (stores headers + transport type for auto-reconnect)
+      const newState = await establishConnection(targetUrl, mergedHeaders);
+      const connectedClient = newState.client;
       saveSessionsToDisk();
 
       const toolsRes = await connectedClient.listTools().catch(() => ({ tools: [] }));
@@ -682,13 +736,13 @@ async function startServer() {
       return res.status(400).json({ error: "Tool name is required" });
     }
 
-    const state = connections.get(serverUrl)!;
-
     try {
-      const result = await state.client.callTool({
+      const live = await ensureConnection(serverUrl);
+      const result = await live.client.callTool({
         name,
         arguments: args || {},
       });
+      live.lastActivity = Date.now();
       res.json({ success: true, result });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message || String(err) });
@@ -706,10 +760,10 @@ async function startServer() {
       return res.status(400).json({ error: "Resource URI is required" });
     }
 
-    const state = connections.get(serverUrl)!;
-
     try {
-      const result = await state.client.readResource({ uri });
+      const live = await ensureConnection(serverUrl);
+      const result = await live.client.readResource({ uri });
+      live.lastActivity = Date.now();
       res.json({ success: true, result });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message || String(err) });
@@ -727,13 +781,13 @@ async function startServer() {
       return res.status(400).json({ error: "Prompt name is required" });
     }
 
-    const state = connections.get(serverUrl)!;
-
     try {
-      const result = await state.client.getPrompt({
+      const live = await ensureConnection(serverUrl);
+      const result = await live.client.getPrompt({
         name,
         arguments: args || {},
       });
+      live.lastActivity = Date.now();
       res.json({ success: true, result });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message || String(err) });
