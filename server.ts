@@ -102,6 +102,27 @@ async function startServer() {
   const PORT = 3000;
   const connections = new Map<string, ConnectionState>();
   const SESSIONS_FILE = path.join(process.cwd(), ".mcp_sessions.json");
+  const OAUTH_FILE = path.join(process.cwd(), ".mcp_oauth.json");
+
+  // Load saved OAuth tokens from disk on startup
+  try {
+    if (fs.existsSync(OAUTH_FILE)) {
+      const savedOAuth = JSON.parse(fs.readFileSync(OAUTH_FILE, "utf8"));
+      if (savedOAuth && savedOAuth.accessToken) {
+        activeOAuthTokens = savedOAuth;
+      }
+    }
+  } catch (_) {}
+
+  function saveOAuthToDisk() {
+    try {
+      if (activeOAuthTokens) {
+        fs.writeFileSync(OAUTH_FILE, JSON.stringify(activeOAuthTokens, null, 2), "utf8");
+      } else if (fs.existsSync(OAUTH_FILE)) {
+        fs.unlinkSync(OAUTH_FILE);
+      }
+    } catch (_) {}
+  }
 
   function saveSessionsToDisk() {
     try {
@@ -336,6 +357,7 @@ async function startServer() {
         provider: pending.provider,
         clientId: pending.clientId,
       };
+      saveOAuthToDisk();
 
       res.send(`
         <!DOCTYPE html>
@@ -457,6 +479,7 @@ async function startServer() {
         expiresIn,
         expiresAt: Date.now() + expiresIn * 1000,
       };
+      saveOAuthToDisk();
 
       res.json({ success: true, tokens: activeOAuthTokens });
     } catch (err: any) {
@@ -467,6 +490,7 @@ async function startServer() {
   // Endpoint: Logout / Revoke OAuth Session
   app.post("/api/oauth/logout", (req, res) => {
     activeOAuthTokens = null;
+    saveOAuthToDisk();
     res.json({ success: true });
   });
 

@@ -157,7 +157,18 @@ export default function App() {
     return localStorage.getItem("mcp_jnm_active_url") || "https://api.githubcopilot.com/mcp/";
   });
   const [connecting, setConnecting] = useState(false);
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(() => {
+    try {
+      const saved = localStorage.getItem("mcp_jnm_cached_connections");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return true;
+      }
+      const token = localStorage.getItem("mcp_jnm_api_token");
+      if (token) return true;
+    } catch (_) {}
+    return false;
+  });
   const [error, setError] = useState<string | null>(null);
 
   // OAuth 2.0 states
@@ -233,6 +244,7 @@ export default function App() {
       const res = await fetch("/api/mcp/status");
       const data = await res.json();
       if (data.connections && data.connections.length > 0) {
+        setIsLoggedIn(true);
         setConnections(data.connections);
         try {
           localStorage.setItem("mcp_jnm_cached_connections", JSON.stringify(data.connections));
@@ -627,7 +639,7 @@ export default function App() {
 
     window.addEventListener("message", handleOAuthMessage);
     return () => window.removeEventListener("message", handleOAuthMessage);
-  }, [inputUrl]);
+  }, []);
 
   const filteredTools = tools.filter(
     (t) =>
