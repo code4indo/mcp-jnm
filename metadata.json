@@ -1,0 +1,6 @@
+{
+  "name": "MCP Connection",
+  "description": "Model Context Protocol Client environment with @modelcontextprotocol/sdk",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
