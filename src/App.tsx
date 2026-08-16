@@ -132,6 +132,7 @@ const CLOUDFLARE_SANDBOX_CONTAINER_TOOLS: MCPTool[] = [
 ];
 
 const PRESET_SERVERS = [
+  { name: "GitHub Copilot MCP", url: "https://api.githubcopilot.com/mcp/" },
   { name: "SSH MCP Server", url: "https://mcp-ssh.jatnikonm.tech/mcp" },
   { name: "Containers MCP Server", url: "https://mcp-containers.jatnikonm.tech/mcp" },
   { name: "Containers SSE Endpoint", url: "https://mcp-containers.jatnikonm.tech/sse" },
@@ -139,10 +140,22 @@ const PRESET_SERVERS = [
 ];
 
 export default function App() {
-  const [connections, setConnections] = useState<any[]>([]);
-  const [activeServerUrl, setActiveServerUrl] = useState<string>("https://mcp-ssh.jatnikonm.tech/mcp");
-  const [apiToken, setApiToken] = useState("");
-  const [inputUrl, setInputUrl] = useState("https://mcp-ssh.jatnikonm.tech/mcp");
+  const [connections, setConnections] = useState<any[]>(() => {
+    try {
+      const saved = localStorage.getItem("mcp_jnm_cached_connections");
+      if (saved) return JSON.parse(saved);
+    } catch (_) {}
+    return [];
+  });
+  const [activeServerUrl, setActiveServerUrl] = useState<string>(() => {
+    return localStorage.getItem("mcp_jnm_active_url") || "https://api.githubcopilot.com/mcp/";
+  });
+  const [apiToken, setApiToken] = useState(() => {
+    return localStorage.getItem("mcp_jnm_api_token") || "";
+  });
+  const [inputUrl, setInputUrl] = useState(() => {
+    return localStorage.getItem("mcp_jnm_active_url") || "https://api.githubcopilot.com/mcp/";
+  });
   const [connecting, setConnecting] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -221,6 +234,9 @@ export default function App() {
       const data = await res.json();
       if (data.connections && data.connections.length > 0) {
         setConnections(data.connections);
+        try {
+          localStorage.setItem("mcp_jnm_cached_connections", JSON.stringify(data.connections));
+        } catch (_) {}
         if (!data.connections.find((c: any) => c.serverUrl === activeServerUrl)) {
           setActiveServerUrl(data.connections[0].serverUrl);
           setInputUrl(data.connections[0].serverUrl);
@@ -233,8 +249,6 @@ export default function App() {
         }
         return true;
       } else {
-        setConnections([]);
-        if (data.error) setError(data.error);
         return false;
       }
     } catch (err: any) {
@@ -285,9 +299,14 @@ export default function App() {
 
       if (data.success) {
         setIsLoggedIn(true);
+        try {
+          localStorage.setItem("mcp_jnm_active_url", targetUrl);
+          if (apiToken) localStorage.setItem("mcp_jnm_api_token", apiToken);
+        } catch (_) {}
+
         setConnections(prev => {
           const others = prev.filter(c => c.serverUrl !== targetUrl);
-          return [...others, {
+          const next = [...others, {
             serverUrl: targetUrl,
             connected: true,
             tools: data.tools || [],
@@ -295,6 +314,10 @@ export default function App() {
             prompts: data.prompts || [],
             serverVersion: data.serverVersion || null
           }];
+          try {
+            localStorage.setItem("mcp_jnm_cached_connections", JSON.stringify(next));
+          } catch (_) {}
+          return next;
         });
         setError(null);
 
@@ -354,10 +377,16 @@ export default function App() {
       });
       setConnections(prev => {
         const nextConns = prev.filter(c => c.serverUrl !== urlToDisconnect);
+        try {
+          localStorage.setItem("mcp_jnm_cached_connections", JSON.stringify(nextConns));
+        } catch (_) {}
         if (activeServerUrl === urlToDisconnect) {
           if (nextConns.length > 0) {
             setActiveServerUrl(nextConns[0].serverUrl);
             setInputUrl(nextConns[0].serverUrl);
+            try {
+              localStorage.setItem("mcp_jnm_active_url", nextConns[0].serverUrl);
+            } catch (_) {}
           } else {
             setIsLoggedIn(false);
           }
@@ -567,7 +596,7 @@ export default function App() {
   useEffect(() => {
     checkStatus().then((alreadyConnected) => {
       if (!alreadyConnected) {
-        handleConnect("https://mcp-ssh.jatnikonm.tech/mcp");
+        handleConnect(activeServerUrl || "https://api.githubcopilot.com/mcp/");
       }
     });
     fetchOAuthSession();

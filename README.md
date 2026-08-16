@@ -48,12 +48,31 @@ npm run dev
 ```
 Open `http://localhost:3000` in your browser.
 
-### 2. Run with CLI
+### 2. Interactive Persistent REPL Shell
 ```bash
-# Connect to an MCP server directly
+# Launch interactive REPL session with auto-reconnect & tab auto-complete
+npm run cli -- shell
+
+# Or connect to a specific server URL with persistent session
+npm run cli -- shell https://api.githubcopilot.com/mcp/ -H "Authorization: Bearer <TOKEN>"
+```
+
+Inside the REPL prompt (`mcp(github)> `):
+- `tools` - List all tools
+- `describe <tool_name>` - Inspect tool JSON Schema
+- `call <tool_name> <json_args>` - Execute tool call with **0ms latency**
+- `ping` - Test round-trip latency & heartbeat
+- `save-profile <name>` - Save URL & headers to `~/.mcp-jnm/config.json`
+- `profile <name>` - Switch to a cached profile instantly
+- `connect <url>` - Switch target server dynamically
+- `exit` - Close session
+
+### 3. Direct One-Off Commands
+```bash
+# List tools directly
 npm run cli -- -u "https://api.githubcopilot.com/mcp/" -H "Authorization: Bearer <TOKEN>" tools
 
-# Call a tool
+# Call a tool directly
 npm run cli -- -u "https://api.githubcopilot.com/mcp/" -H "Authorization: Bearer <TOKEN>" call get_me '{}'
 ```
 

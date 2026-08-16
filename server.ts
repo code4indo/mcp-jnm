@@ -101,6 +101,56 @@ async function startServer() {
 
   const PORT = 3000;
   const connections = new Map<string, ConnectionState>();
+  const SESSIONS_FILE = path.join(process.cwd(), ".mcp_sessions.json");
+
+  function saveSessionsToDisk() {
+    try {
+      const activeUrls = Array.from(connections.keys()).map((url) => {
+        return { url };
+      });
+      fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ urls: activeUrls }, null, 2), "utf8");
+    } catch (_) {}
+  }
+
+  async function restoreSessionsFromDisk() {
+    try {
+      if (fs.existsSync(SESSIONS_FILE)) {
+        const raw = fs.readFileSync(SESSIONS_FILE, "utf8");
+        const data = JSON.parse(raw);
+        if (Array.isArray(data.urls)) {
+          for (const item of data.urls) {
+            const u = typeof item === "string" ? item : item.url;
+            if (u && !connections.has(u)) {
+              console.log(`[Auto-Restore] Re-establishing MCP connection to ${u}...`);
+              // Internal connection attempt
+              try {
+                const urlObj = new URL(u);
+                const client = new Client({ name: "mcp-web-client", version: "1.0.5" }, { capabilities: {} } as any);
+                let transport: any;
+                const reqHeaders: Record<string, string> = { "Accept": "application/json, text/event-stream" };
+                if (activeOAuthTokens?.accessToken && (u.includes("github") || u.includes("cloudflare"))) {
+                  reqHeaders["Authorization"] = `Bearer ${activeOAuthTokens.accessToken}`;
+                }
+                if (urlObj.pathname.endsWith("/sse")) {
+                  transport = new SSEClientTransport(urlObj, { requestInit: { headers: reqHeaders }, eventSourceInit: { headers: reqHeaders } as any });
+                } else {
+                  transport = new StreamableHTTPClientTransport(urlObj, { requestInit: { headers: reqHeaders } });
+                }
+                await client.connect(transport);
+                connections.set(u, { client, transport, serverUrl: u });
+                console.log(`[Auto-Restore] Successfully restored ${u}`);
+              } catch (e: any) {
+                console.warn(`[Auto-Restore] Could not auto-restore ${u}:`, e.message);
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Restore previous sessions in background
+  restoreSessionsFromDisk();
 
   // ==========================================
   // OAuth 2.0 API Endpoints
@@ -559,6 +609,7 @@ async function startServer() {
         transport: connectedTransport,
         serverUrl: targetUrl,
       });
+      saveSessionsToDisk();
 
       const toolsRes = await connectedClient.listTools().catch(() => ({ tools: [] }));
       const resourcesRes = await connectedClient.listResources().catch(() => ({ resources: [] }));
@@ -591,6 +642,7 @@ async function startServer() {
         await state.transport.close();
       } catch (_) {}
       connections.delete(url);
+      saveSessionsToDisk();
     }
     res.json({ success: true, connected: false });
   });
